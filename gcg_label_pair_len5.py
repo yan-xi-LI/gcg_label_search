@@ -13,6 +13,8 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 # ============================================================
 
 TRAIN_DIR = "./train"   # expected: ./train/pos/*.txt and ./train/neg/*.txt
+DEV_DIR = "./dev"         # expected: ./dev/pos/*.txt and ./dev/neg/*.txt
+TEST_DIR = "./test"       # expected: ./test/pos/*.txt and ./test/neg/*.txt
 MODEL_NAME_OR_PATH = "google/gemma-3-4b-it"
 
 SEED = 42
@@ -101,43 +103,6 @@ def load_train_folder(train_dir: str) -> List[Tuple[str, int]]:
     return data
 
 
-def stratified_split(
-    data: List[Tuple[str, int]],
-    train_ratio: float,
-    dev_ratio: float,
-    test_ratio: float,
-) -> Dict[str, List[Tuple[str, int]]]:
-    assert abs(train_ratio + dev_ratio + test_ratio - 1.0) < 1e-8
-
-    pos = [x for x in data if x[1] == 1]
-    neg = [x for x in data if x[1] == 0]
-
-    def split_one(lst):
-        n = len(lst)
-        n_train = int(round(n * train_ratio))
-        n_dev = int(round(n * dev_ratio))
-        if n_train + n_dev > n:
-            n_dev = max(0, n - n_train)
-        n_test = n - n_train - n_dev
-        return (
-            lst[:n_train],
-            lst[n_train:n_train + n_dev],
-            lst[n_train + n_dev:n_train + n_dev + n_test],
-        )
-
-    pos_train, pos_dev, pos_test = split_one(pos)
-    neg_train, neg_dev, neg_test = split_one(neg)
-
-    train = pos_train + neg_train
-    dev = pos_dev + neg_dev
-    test = pos_test + neg_test
-
-    random.shuffle(train)
-    random.shuffle(dev)
-    random.shuffle(test)
-
-    return {"train": train, "dev": dev, "test": test}
-
 
 # ============================================================
 # Token utilities
@@ -171,11 +136,15 @@ def random_label_seq(searchable_ids: List[int], length: int) -> List[int]:
 
 def build_base_prompt(
     text: str,
+    y: int,
     injected: bool,
     pos_label_text: str,
     neg_label_text: str,
 ) -> str:
-    inj = INJECTION_LINE if injected else ""
+    if not injected:
+        inj = ""
+    else:
+        inj = NEGATIVE_INJECTION_LINE if y == 1 else POSITIVE_INJECTION_LINE
     return FEWSHOT_TEMPLATE.format(
         TEXT=text,
         INJ=inj,
@@ -193,7 +162,7 @@ def build_base_prompts(
     prompts = []
     ys = []
     for text, y in data:
-        prompts.append(build_base_prompt(text, injected, pos_label_text, neg_label_text))
+        prompts.append(build_base_prompt(text, y, injected, pos_label_text, neg_label_text))
         ys.append(y)
     return prompts, ys
 
@@ -750,12 +719,17 @@ def full_evaluate(
 # ============================================================
 
 def main():
-    print("[INFO] Loading data...")
-    data = load_train_folder(TRAIN_DIR)
-    print(f"[INFO] Loaded {len(data)} samples from {TRAIN_DIR}")
+    print("[INFO] Loading datasets from fixed folders...")
+    train_data = load_train_folder(TRAIN_DIR)
+    dev_data = load_train_folder(DEV_DIR)
+    test_data = load_train_folder(TEST_DIR)
 
-    if len(data) < 10:
-        raise ValueError("Dataset is too small for train/dev/test split.")
+    print(f"[INFO] Loaded train={len(train_data)} samples from {TRAIN_DIR}")
+    print(f"[INFO] Loaded dev={len(dev_data)} samples from {DEV_DIR}")
+    print(f"[INFO] Loaded test={len(test_data)} samples from {TEST_DIR}")
+
+    if len(train_data) == 0 or len(dev_data) == 0 or len(test_data) == 0:
+        raise ValueError("train/dev/test folders must all be non-empty.")
 
     print("[INFO] Loading tokenizer/model...")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME_OR_PATH, use_fast=False)
@@ -770,11 +744,6 @@ def main():
         device_map=None,
     ).to(DEVICE)
     model.eval()
-
-    splits = stratified_split(data, TRAIN_RATIO, DEV_RATIO, TEST_RATIO)
-    train_data = splits["train"]
-    dev_data = splits["dev"]
-    test_data = splits["test"]
 
     print(f"[INFO] train={len(train_data)}  dev={len(dev_data)}  test={len(test_data)}")
 
