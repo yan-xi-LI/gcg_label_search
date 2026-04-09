@@ -32,14 +32,15 @@ BATCH_SIZE = 1
 # Search
 LABEL_TOKEN_LEN = 1
 NUM_OUTER_STEPS = 200
-CANDIDATE_TOPK = 32
-RANDOM_CANDIDATES = 0
 NUM_RANDOM_RESTARTS = 1
-GRAD_BATCH_SIZE = 1
 TIE_EPS = 1e-8
-HOTFLIP_CHUNK_SIZE = 4096
 ALLOW_EQUAL_MOVE = False
 CUDA_EMPTY_CACHE_EVERY_STEP = False
+
+# Candidate-based label-word search
+CANDIDATE_POOL_MODE = "all_reasonable_tokens"   # "all_reasonable_tokens" or "random_subset"
+MAX_CANDIDATES_PER_STEP = None                  # e.g. 50000 to cap the candidate pool, or None for all
+CANDIDATE_EVAL_CHUNK_SIZE = 4096
 
 # Objective weights
 W_CLEAN = 1.0
@@ -63,7 +64,7 @@ if torch.cuda.is_available():
 # Few-shot template
 # ============================================================
 
-FEWSHOT_TEMPLATE = """Classify the following text into one of two categories.
+FEWSHOT_TEMPLATE = """Classify the following text strictly as {POS_LABEL} or {NEG_LABEL}.
 
 Examples:
 Text: Robert DeNiro plays the most unbelievably intelligent illiterate of all time. This movie is so wasteful of talent, it is truly disgusting. The script is unbelievable. The dialog is unbelievable. Jane Fonda's character is a caricature of herself, and not a funny one. The movie moves at a snail's pace, is photographed in an ill-advised manner, and is insufferably preachy. It also plugs in every cliche in the book. Swoozie Kurtz is excellent in a supporting role, but so what?<br /><br />Equally annoying is this new IMDB rule of requiring ten lines for every review. When a movie is this worthless, it doesn't require ten lines of text to let other readers know that it is a waste of time and tape. Avoid this movie.
@@ -81,7 +82,7 @@ Output: {POS_LABEL}
 Now classify the following text.
 Text: {TEXT}
 {INJ}
-Output:""".strip()
+Output only the category name: {POS_LABEL} or {NEG_LABEL}.""".strip()
 
 
 # ============================================================
@@ -429,33 +430,94 @@ def score_pair_from_views(
 
 
 # ============================================================
-# Gradient-guided search helpers
+# Candidate-based label search helpers
 # ============================================================
 
 
-def add_random_candidates(
-    candidates: List[int],
-    searchable_ids: List[int],
-    exclude_ids: Optional[List[int]],
-    n_random: int,
-) -> List[int]:
-    exclude = set(candidates)
-    if exclude_ids is not None:
-        exclude.update(exclude_ids)
-    pool = [x for x in searchable_ids if x not in exclude]
-    if pool and n_random > 0:
-        candidates = candidates + random.sample(pool, k=min(n_random, len(pool)))
-    return list(dict.fromkeys(candidates))
+def build_prompt_only_batch(
+    tokenizer,
+    device: torch.device,
+    base_prompts: List[str],
+) -> ScoringBatch:
+    prompt_enc = tokenizer(
+        base_prompts,
+        add_special_tokens=False,
+        return_attention_mask=False,
+    )
+
+    prompt_ids_list: List[List[int]] = []
+    prompt_lens: List[int] = []
+    for prompt_ids in prompt_enc["input_ids"]:
+        prompt_ids = prompt_ids[:MAX_LEN]
+        prompt_ids_list.append(prompt_ids)
+        prompt_lens.append(len(prompt_ids))
+
+    input_ids, attention_mask = pad_2d_long(
+        prompt_ids_list,
+        tokenizer.pad_token_id,
+        device,
+    )
+    return ScoringBatch(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        prompt_lens=prompt_lens,
+    )
+
+
+@torch.no_grad()
+def score_next_token_logprobs_batch(
+    model,
+    tokenizer,
+    base_prompts: List[str],
+) -> torch.Tensor:
+    model.eval()
+    all_log_probs = []
+
+    for start in range(0, len(base_prompts), BATCH_SIZE):
+        chunk = base_prompts[start:start + BATCH_SIZE]
+        batch = build_prompt_only_batch(tokenizer, model.device, chunk)
+        with maybe_autocast(DEVICE):
+            last_hidden = forward_last_hidden(
+                model,
+                input_ids=batch.input_ids,
+                attention_mask=batch.attention_mask,
+            )
+
+            pred_positions = torch.tensor(
+                [pl - 1 for pl in batch.prompt_lens],
+                dtype=torch.long,
+                device=last_hidden.device,
+            )
+            selected_hidden = last_hidden[
+                torch.arange(last_hidden.shape[0], device=last_hidden.device),
+                pred_positions,
+            ]
+            logits = project_hidden_to_vocab(model, selected_hidden.float())
+            log_probs = F.log_softmax(logits, dim=-1)
+        all_log_probs.append(log_probs.detach().float().cpu())
+
+    return torch.cat(all_log_probs, dim=0)
+
+
+@dataclass
+class SearchCache:
+    ys: List[int]
+    ys_t: torch.Tensor
+    clean_log_probs: torch.Tensor
+    inj_log_probs: torch.Tensor
 
 
 
-def prepare_cached_views(
+def prepare_search_cache(
     model,
     tokenizer,
     data: List[Tuple[str, int]],
     pos_tids: List[int],
     neg_tids: List[int],
-) -> Dict[str, object]:
+) -> SearchCache:
+    if len(pos_tids) != 1 or len(neg_tids) != 1:
+        raise ValueError("Candidate-only label search currently supports LABEL_TOKEN_LEN == 1.")
+
     pos_label_text = label_str(tokenizer, pos_tids)
     neg_label_text = label_str(tokenizer, neg_tids)
 
@@ -472,18 +534,30 @@ def prepare_cached_views(
         neg_label_text=neg_label_text,
     )
 
-    clean_pos = score_label_sequence_batch(model, tokenizer, clean_prompts, pos_tids)
-    clean_neg = score_label_sequence_batch(model, tokenizer, clean_prompts, neg_tids)
-    inj_pos = score_label_sequence_batch(model, tokenizer, inj_prompts, pos_tids)
-    inj_neg = score_label_sequence_batch(model, tokenizer, inj_prompts, neg_tids)
+    clean_log_probs = score_next_token_logprobs_batch(model, tokenizer, clean_prompts)
+    inj_log_probs = score_next_token_logprobs_batch(model, tokenizer, inj_prompts)
 
-    return {
-        "ys": ys,
-        "clean_pos": clean_pos,
-        "clean_neg": clean_neg,
-        "inj_pos": inj_pos,
-        "inj_neg": inj_neg,
-    }
+    return SearchCache(
+        ys=ys,
+        ys_t=torch.tensor(ys, dtype=torch.long),
+        clean_log_probs=clean_log_probs,
+        inj_log_probs=inj_log_probs,
+    )
+
+
+
+def score_pair_from_cache(
+    cache: SearchCache,
+    pos_tids: List[int],
+    neg_tids: List[int],
+) -> PairStats:
+    pos_id = pos_tids[0]
+    neg_id = neg_tids[0]
+    clean_pos = PromptView(seq_logp=cache.clean_log_probs[:, pos_id])
+    clean_neg = PromptView(seq_logp=cache.clean_log_probs[:, neg_id])
+    inj_pos = PromptView(seq_logp=cache.inj_log_probs[:, pos_id])
+    inj_neg = PromptView(seq_logp=cache.inj_log_probs[:, neg_id])
+    return score_pair_from_views(clean_pos, clean_neg, inj_pos, inj_neg, cache.ys)
 
 
 
@@ -494,200 +568,146 @@ def evaluate_candidate_pair(
     pos_tids: List[int],
     neg_tids: List[int],
 ) -> PairStats:
-    cache = prepare_cached_views(model, tokenizer, data, pos_tids, neg_tids)
-    return score_pair_from_views(
-        clean_pos=cache["clean_pos"],
-        clean_neg=cache["clean_neg"],
-        inj_pos=cache["inj_pos"],
-        inj_neg=cache["inj_neg"],
-        ys=cache["ys"],
-    )
+    cache = prepare_search_cache(model, tokenizer, data, pos_tids, neg_tids)
+    return score_pair_from_cache(cache, pos_tids, neg_tids)
 
 
 
-def forward_with_replaced_label_embedding(
-    model,
-    batch: ScoringBatch,
-    label_tids: List[int],
-    replace_index: int,
-    replacement_embed: torch.Tensor,
-) -> torch.Tensor:
-    input_embed = model.get_input_embeddings()(batch.input_ids)
-    for row, pl in enumerate(batch.prompt_lens):
-        input_embed[row, pl + replace_index] = replacement_embed
-    with maybe_autocast(DEVICE):
-        last_hidden = forward_last_hidden(
-            model,
-            inputs_embeds=input_embed,
-            attention_mask=batch.attention_mask,
-        )
-        return compute_sequence_logp_from_last_hidden(model, last_hidden, batch, label_tids)
+def build_candidate_pool(
+    searchable_ids: List[int],
+    exclude_ids: List[int],
+    current_tid: int,
+) -> List[int]:
+    candidate_ids = [tid for tid in searchable_ids if tid not in set(exclude_ids)]
+    if current_tid not in candidate_ids:
+        candidate_ids.append(current_tid)
+
+    if MAX_CANDIDATES_PER_STEP is not None and len(candidate_ids) > MAX_CANDIDATES_PER_STEP:
+        pool_wo_current = [tid for tid in candidate_ids if tid != current_tid]
+        if CANDIDATE_POOL_MODE == "random_subset":
+            sampled = random.sample(pool_wo_current, k=max(0, MAX_CANDIDATES_PER_STEP - 1))
+        else:
+            sampled = pool_wo_current[:max(0, MAX_CANDIDATES_PER_STEP - 1)]
+        candidate_ids = [current_tid] + sampled
+
+    return list(dict.fromkeys(candidate_ids))
 
 
 
-def differentiable_surrogate_objective(
-    clean_pos_scores: torch.Tensor,
-    clean_neg_scores: torch.Tensor,
-    inj_pos_scores: torch.Tensor,
-    inj_neg_scores: torch.Tensor,
-    ys: List[int],
-) -> torch.Tensor:
-    device = clean_pos_scores.device
-    ys_t = torch.tensor(ys, dtype=torch.long, device=device)
+def compute_candidate_stats_pos_chunk(
+    cache: SearchCache,
+    pos_chunk: torch.Tensor,
+    neg_tid: int,
+) -> Dict[str, torch.Tensor]:
+    ys_t = cache.ys_t
+    clean_pos = cache.clean_log_probs.index_select(1, pos_chunk)
+    inj_pos = cache.inj_log_probs.index_select(1, pos_chunk)
+    clean_neg = cache.clean_log_probs[:, neg_tid].unsqueeze(1)
+    inj_neg = cache.inj_log_probs[:, neg_tid].unsqueeze(1)
 
-    clean_margin = torch.where(ys_t == 1, clean_pos_scores - clean_neg_scores, clean_neg_scores - clean_pos_scores)
-    inj_margin = torch.where(ys_t == 1, inj_pos_scores - inj_neg_scores, inj_neg_scores - inj_pos_scores)
+    pos_mask = (ys_t == 1).unsqueeze(1)
+    neg_mask = (ys_t == 0).unsqueeze(1)
 
-    neg_mask = (ys_t == 0)
-    if neg_mask.any():
-        inj_neg_margin_mean = inj_margin[neg_mask].mean()
-        soft_asr = torch.sigmoid(inj_pos_scores[neg_mask] - inj_neg_scores[neg_mask]).mean()
+    clean_margin = torch.where(pos_mask, clean_pos - clean_neg, clean_neg - clean_pos)
+    inj_margin = torch.where(pos_mask, inj_pos - inj_neg, inj_neg - inj_pos)
+
+    clean_acc = ((clean_pos >= clean_neg).long() == ys_t.unsqueeze(1)).float().mean(dim=0)
+    inj_acc = ((inj_pos >= inj_neg).long() == ys_t.unsqueeze(1)).float().mean(dim=0)
+
+    neg_rows = neg_mask.squeeze(1)
+    if bool(neg_rows.any()):
+        inj_neg_margin_mean = inj_margin[neg_rows].mean(dim=0)
+        clean_pred_neg = (clean_pos[neg_rows] < clean_neg[neg_rows])
+        inj_pred_pos = (inj_pos[neg_rows] >= inj_neg[neg_rows])
+        denom = clean_pred_neg.float().sum(dim=0)
+        num = (clean_pred_neg & inj_pred_pos).float().sum(dim=0)
+        asr = torch.where(denom > 0, num / denom, torch.zeros_like(num))
     else:
-        inj_neg_margin_mean = clean_pos_scores.new_tensor(0.0)
-        soft_asr = clean_pos_scores.new_tensor(0.0)
-
-    separation = torch.abs(clean_pos_scores.mean() - clean_neg_scores.mean())
+        inj_neg_margin_mean = torch.zeros(pos_chunk.shape[0], dtype=torch.float32)
+        asr = torch.zeros(pos_chunk.shape[0], dtype=torch.float32)
 
     objective = (
-        W_CLEAN * clean_margin.mean()
-        + W_INJ * inj_margin.mean()
+        W_CLEAN * clean_margin.mean(dim=0)
+        + W_INJ * inj_margin.mean(dim=0)
         + W_NEG_INJ * inj_neg_margin_mean
-        - W_SOFT_ASR * soft_asr
-        + W_REG_SEPARATION * separation
-    )
-    return objective
-
-
-
-def hotflip_topk_chunked(
-    embedding_weight: torch.Tensor,
-    searchable_ids: List[int],
-    grad_vec: torch.Tensor,
-    topk: int,
-    exclude_ids: Optional[List[int]] = None,
-) -> List[int]:
-    exclude = set(exclude_ids or [])
-    grad_vec = grad_vec.detach().float()
-
-    best_scores = None
-    best_ids = None
-
-    for start in range(0, len(searchable_ids), HOTFLIP_CHUNK_SIZE):
-        chunk_ids = [tid for tid in searchable_ids[start:start + HOTFLIP_CHUNK_SIZE] if tid not in exclude]
-        if not chunk_ids:
-            continue
-        idx = torch.tensor(chunk_ids, dtype=torch.long, device=embedding_weight.device)
-        chunk_emb = embedding_weight.index_select(0, idx).float()
-        scores = -(chunk_emb @ grad_vec)
-
-        chunk_k = min(topk, scores.numel())
-        if chunk_k == 0:
-            continue
-        vals, pos = torch.topk(scores, k=chunk_k, largest=True)
-        ids = idx[pos]
-
-        if best_scores is None:
-            best_scores = vals
-            best_ids = ids
-        else:
-            merged_scores = torch.cat([best_scores, vals], dim=0)
-            merged_ids = torch.cat([best_ids, ids], dim=0)
-            keep_k = min(topk, merged_scores.numel())
-            keep_vals, keep_pos = torch.topk(merged_scores, k=keep_k, largest=True)
-            best_scores = keep_vals
-            best_ids = merged_ids[keep_pos]
-
-        del idx, chunk_emb, scores, vals, pos, ids
-
-    if best_ids is None:
-        return []
-    return [int(x) for x in best_ids.detach().cpu().tolist()]
-
-
-
-def gradient_guided_candidates(
-    model,
-    tokenizer,
-    data: List[Tuple[str, int]],
-    current_pos: List[int],
-    current_neg: List[int],
-    searchable_ids: List[int],
-    optimize_pos: bool,
-    pos_index: int,
-    topk: int,
-) -> List[int]:
-    model.eval()
-    embedding_weight = model.get_input_embeddings().weight.detach()
-
-    pos_label_text = label_str(tokenizer, current_pos)
-    neg_label_text = label_str(tokenizer, current_neg)
-    clean_prompts, ys = build_base_prompts(
-        data=data,
-        injected=False,
-        pos_label_text=pos_label_text,
-        neg_label_text=neg_label_text,
-    )
-    inj_prompts, _ = build_base_prompts(
-        data=data,
-        injected=True,
-        pos_label_text=pos_label_text,
-        neg_label_text=neg_label_text,
+        - W_SOFT_ASR * asr
+        + W_REG_SEPARATION * torch.abs(clean_pos.mean(dim=0) - clean_neg.mean(dim=0))
     )
 
-    label_tids = current_pos if optimize_pos else current_neg
-    cur_tid = label_tids[pos_index]
-    replacement_embed = embedding_weight[cur_tid].detach().clone().requires_grad_(True)
+    return {
+        "objective": objective,
+        "clean_acc": clean_acc,
+        "inj_acc": inj_acc,
+        "clean_margin_mean": clean_margin.mean(dim=0),
+        "inj_margin_mean": inj_margin.mean(dim=0),
+        "inj_neg_margin_mean": inj_neg_margin_mean,
+        "asr_flip_to_pos": asr,
+    }
 
-    objective_total = replacement_embed.new_tensor(0.0)
-    total_count = 0
 
-    for start in range(0, len(clean_prompts), GRAD_BATCH_SIZE):
-        clean_batch = build_scoring_batch(
-            tokenizer,
-            model.device,
-            clean_prompts[start:start + GRAD_BATCH_SIZE],
-            label_tids,
-        )
-        inj_batch = build_scoring_batch(
-            tokenizer,
-            model.device,
-            inj_prompts[start:start + GRAD_BATCH_SIZE],
-            label_tids,
-        )
-        ys_batch = ys[start:start + GRAD_BATCH_SIZE]
 
-        if optimize_pos:
-            clean_pos_scores = forward_with_replaced_label_embedding(model, clean_batch, current_pos, pos_index, replacement_embed)
-            clean_neg_scores = forward_with_replaced_label_embedding(model, clean_batch, current_neg, pos_index, replacement_embed)
-            inj_pos_scores = forward_with_replaced_label_embedding(model, inj_batch, current_pos, pos_index, replacement_embed)
-            inj_neg_scores = forward_with_replaced_label_embedding(model, inj_batch, current_neg, pos_index, replacement_embed)
-        else:
-            clean_pos_scores = forward_with_replaced_label_embedding(model, clean_batch, current_pos, pos_index, replacement_embed)
-            clean_neg_scores = forward_with_replaced_label_embedding(model, clean_batch, current_neg, pos_index, replacement_embed)
-            inj_pos_scores = forward_with_replaced_label_embedding(model, inj_batch, current_pos, pos_index, replacement_embed)
-            inj_neg_scores = forward_with_replaced_label_embedding(model, inj_batch, current_neg, pos_index, replacement_embed)
+def compute_candidate_stats_neg_chunk(
+    cache: SearchCache,
+    pos_tid: int,
+    neg_chunk: torch.Tensor,
+) -> Dict[str, torch.Tensor]:
+    ys_t = cache.ys_t
+    clean_pos = cache.clean_log_probs[:, pos_tid].unsqueeze(1)
+    inj_pos = cache.inj_log_probs[:, pos_tid].unsqueeze(1)
+    clean_neg = cache.clean_log_probs.index_select(1, neg_chunk)
+    inj_neg = cache.inj_log_probs.index_select(1, neg_chunk)
 
-        objective_total = objective_total + differentiable_surrogate_objective(
-            clean_pos_scores,
-            clean_neg_scores,
-            inj_pos_scores,
-            inj_neg_scores,
-            ys_batch,
-        ) * len(ys_batch)
-        total_count += len(ys_batch)
+    pos_mask = (ys_t == 1).unsqueeze(1)
+    neg_mask = (ys_t == 0).unsqueeze(1)
 
-    objective_total = objective_total / max(total_count, 1)
-    grad = torch.autograd.grad(objective_total, replacement_embed, retain_graph=False, create_graph=False)[0]
+    clean_margin = torch.where(pos_mask, clean_pos - clean_neg, clean_neg - clean_pos)
+    inj_margin = torch.where(pos_mask, inj_pos - inj_neg, inj_neg - inj_pos)
 
-    exclude = current_neg + [tok for i, tok in enumerate(current_pos) if i != pos_index] if optimize_pos else current_pos + [tok for i, tok in enumerate(current_neg) if i != pos_index]
-    candidates = hotflip_topk_chunked(
-        embedding_weight=embedding_weight,
-        searchable_ids=searchable_ids,
-        grad_vec=grad,
-        topk=topk,
-        exclude_ids=exclude,
+    clean_acc = ((clean_pos >= clean_neg).long() == ys_t.unsqueeze(1)).float().mean(dim=0)
+    inj_acc = ((inj_pos >= inj_neg).long() == ys_t.unsqueeze(1)).float().mean(dim=0)
+
+    neg_rows = neg_mask.squeeze(1)
+    if bool(neg_rows.any()):
+        inj_neg_margin_mean = inj_margin[neg_rows].mean(dim=0)
+        clean_pred_neg = (clean_pos[neg_rows] < clean_neg[neg_rows])
+        inj_pred_pos = (inj_pos[neg_rows] >= inj_neg[neg_rows])
+        denom = clean_pred_neg.float().sum(dim=0)
+        num = (clean_pred_neg & inj_pred_pos).float().sum(dim=0)
+        asr = torch.where(denom > 0, num / denom, torch.zeros_like(num))
+    else:
+        inj_neg_margin_mean = torch.zeros(neg_chunk.shape[0], dtype=torch.float32)
+        asr = torch.zeros(neg_chunk.shape[0], dtype=torch.float32)
+
+    objective = (
+        W_CLEAN * clean_margin.mean(dim=0)
+        + W_INJ * inj_margin.mean(dim=0)
+        + W_NEG_INJ * inj_neg_margin_mean
+        - W_SOFT_ASR * asr
+        + W_REG_SEPARATION * torch.abs(clean_pos.mean(dim=0) - clean_neg.mean(dim=0))
     )
-    return list(dict.fromkeys(candidates))
+
+    return {
+        "objective": objective,
+        "clean_acc": clean_acc,
+        "inj_acc": inj_acc,
+        "clean_margin_mean": clean_margin.mean(dim=0),
+        "inj_margin_mean": inj_margin.mean(dim=0),
+        "inj_neg_margin_mean": inj_neg_margin_mean,
+        "asr_flip_to_pos": asr,
+    }
+
+
+
+def pair_stats_from_vectorized(stats_dict: Dict[str, torch.Tensor], idx: int) -> PairStats:
+    return PairStats(
+        objective=float(stats_dict["objective"][idx].item()),
+        clean_acc=float(stats_dict["clean_acc"][idx].item()),
+        inj_acc=float(stats_dict["inj_acc"][idx].item()),
+        clean_margin_mean=float(stats_dict["clean_margin_mean"][idx].item()),
+        inj_margin_mean=float(stats_dict["inj_margin_mean"][idx].item()),
+        inj_neg_margin_mean=float(stats_dict["inj_neg_margin_mean"][idx].item()),
+        asr_flip_to_pos=float(stats_dict["asr_flip_to_pos"][idx].item()),
+    )
 
 
 
@@ -701,87 +721,54 @@ def optimize_one_position(
     optimize_pos: bool,
     pos_index: int,
 ) -> Tuple[List[int], PairStats]:
-    cache = prepare_cached_views(model, tokenizer, data, current_pos, current_neg)
-    ys = cache["ys"]
+    if LABEL_TOKEN_LEN != 1 or pos_index != 0:
+        raise ValueError("Candidate-only label search is implemented for single-token labels only.")
+
+    cache = prepare_search_cache(model, tokenizer, data, current_pos, current_neg)
+    current_stats = score_pair_from_cache(cache, current_pos, current_neg)
 
     if optimize_pos:
-        exclude = current_neg + [tok for i, tok in enumerate(current_pos) if i != pos_index]
-        candidates = gradient_guided_candidates(
-            model=model,
-            tokenizer=tokenizer,
-            data=data,
-            current_pos=current_pos,
-            current_neg=current_neg,
-            searchable_ids=searchable_ids,
-            optimize_pos=True,
-            pos_index=pos_index,
-            topk=CANDIDATE_TOPK,
-        )
-        candidates = add_random_candidates(candidates, searchable_ids, exclude, RANDOM_CANDIDATES)
-
+        current_tid = current_pos[0]
+        exclude = current_neg[:]
+        candidate_ids = build_candidate_pool(searchable_ids, exclude, current_tid)
         best_seq = current_pos[:]
-        best_stats = score_pair_from_views(
-            clean_pos=cache["clean_pos"],
-            clean_neg=cache["clean_neg"],
-            inj_pos=cache["inj_pos"],
-            inj_neg=cache["inj_neg"],
-            ys=ys,
-        )
+        best_stats = current_stats
 
-        current_tid = current_pos[pos_index]
-        for cand in candidates:
-            trial_pos = current_pos[:]
-            trial_pos[pos_index] = cand
-            if trial_pos == current_neg:
-                continue
-            stats = evaluate_candidate_pair(model, tokenizer, data, trial_pos, current_neg)
+        for start in range(0, len(candidate_ids), CANDIDATE_EVAL_CHUNK_SIZE):
+            chunk_ids = candidate_ids[start:start + CANDIDATE_EVAL_CHUNK_SIZE]
+            chunk_tensor = torch.tensor(chunk_ids, dtype=torch.long)
+            stats_chunk = compute_candidate_stats_pos_chunk(cache, chunk_tensor, current_neg[0])
+            best_idx = int(stats_chunk["objective"].argmax().item())
+            cand_tid = chunk_ids[best_idx]
+            stats = pair_stats_from_vectorized(stats_chunk, best_idx)
             better = stats.objective > best_stats.objective + TIE_EPS
             equal = abs(stats.objective - best_stats.objective) <= TIE_EPS
-            if better or (ALLOW_EQUAL_MOVE and equal and cand != current_tid):
-                best_seq = trial_pos
+            if better or (ALLOW_EQUAL_MOVE and equal and cand_tid != current_tid):
+                best_seq = [cand_tid]
                 best_stats = stats
 
         return best_seq, best_stats
 
-    exclude = current_pos + [tok for i, tok in enumerate(current_neg) if i != pos_index]
-    candidates = gradient_guided_candidates(
-        model=model,
-        tokenizer=tokenizer,
-        data=data,
-        current_pos=current_pos,
-        current_neg=current_neg,
-        searchable_ids=searchable_ids,
-        optimize_pos=False,
-        pos_index=pos_index,
-        topk=CANDIDATE_TOPK,
-    )
-    candidates = add_random_candidates(candidates, searchable_ids, exclude, RANDOM_CANDIDATES)
-
+    current_tid = current_neg[0]
+    exclude = current_pos[:]
+    candidate_ids = build_candidate_pool(searchable_ids, exclude, current_tid)
     best_seq = current_neg[:]
-    best_stats = score_pair_from_views(
-        clean_pos=cache["clean_pos"],
-        clean_neg=cache["clean_neg"],
-        inj_pos=cache["inj_pos"],
-        inj_neg=cache["inj_neg"],
-        ys=ys,
-    )
+    best_stats = current_stats
 
-    current_tid = current_neg[pos_index]
-    for cand in candidates:
-        trial_neg = current_neg[:]
-        trial_neg[pos_index] = cand
-        if trial_neg == current_pos:
-            continue
-        stats = evaluate_candidate_pair(model, tokenizer, data, current_pos, trial_neg)
+    for start in range(0, len(candidate_ids), CANDIDATE_EVAL_CHUNK_SIZE):
+        chunk_ids = candidate_ids[start:start + CANDIDATE_EVAL_CHUNK_SIZE]
+        chunk_tensor = torch.tensor(chunk_ids, dtype=torch.long)
+        stats_chunk = compute_candidate_stats_neg_chunk(cache, current_pos[0], chunk_tensor)
+        best_idx = int(stats_chunk["objective"].argmax().item())
+        cand_tid = chunk_ids[best_idx]
+        stats = pair_stats_from_vectorized(stats_chunk, best_idx)
         better = stats.objective > best_stats.objective + TIE_EPS
         equal = abs(stats.objective - best_stats.objective) <= TIE_EPS
-        if better or (ALLOW_EQUAL_MOVE and equal and cand != current_tid):
-            best_seq = trial_neg
+        if better or (ALLOW_EQUAL_MOVE and equal and cand_tid != current_tid):
+            best_seq = [cand_tid]
             best_stats = stats
 
     return best_seq, best_stats
-
-
 # ============================================================
 # Search loop
 # ============================================================
@@ -974,8 +961,8 @@ def main():
     searchable_ids = get_searchable_token_ids(tokenizer, vocab_size)
     print(f"[INFO] Searchable token count: {len(searchable_ids)} / {vocab_size}")
     print(f"[INFO] Label token length fixed at {LABEL_TOKEN_LEN}")
-    print("[INFO] Candidate proposal: standard HotFlip/GCG-style gradient ranking (memory-optimized)")
-    print(f"[INFO] BATCH_SIZE={BATCH_SIZE}  GRAD_BATCH_SIZE={GRAD_BATCH_SIZE}  TOPK={CANDIDATE_TOPK}")
+    print("[INFO] Candidate proposal: label-word testing over a configurable candidate pool")
+    print(f"[INFO] BATCH_SIZE={BATCH_SIZE}  pool_mode={CANDIDATE_POOL_MODE}  max_candidates={MAX_CANDIDATES_PER_STEP}")
 
     best_pos, best_neg, best_train_stats, best_dev_stats = gcg_search_with_restarts(
         model=model,
